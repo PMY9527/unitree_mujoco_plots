@@ -18,6 +18,7 @@ include_directories(
   mujoco/include
   mujoco/simulate
   src/lodepng
+  src
 )
 link_directories(mujoco/lib)
 
@@ -33,6 +34,7 @@ file(GLOB SIM_SRC
 
 link_libraries(
   pthread
+  rt
   mujoco
   glfw
   yaml-cpp

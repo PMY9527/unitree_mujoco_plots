@@ -29,11 +29,15 @@
 #include <string>
 #include <thread>
 
+#include <atomic>
+#include <deque>
+
 #include <mujoco/mujoco.h>
 #include "simulate.h"
 #include "array_safety.h"
 #include "unitree_sdk2_bridge.h"
 #include "param.h"
+#include "cmg_viz_shm.h"
 
 #define MUJOCO_PLUGIN_DIR "mujoco_plugin"
 #define NUM_MOTOR_IDL_GO 20
@@ -606,6 +610,444 @@ void *UnitreeSdk2BridgeThread(void *arg)
     sleep(1);
   }
 }
+
+//---------------------------------------- CMG visualisation ---------------------------------------
+
+std::atomic<bool> cmg_viz_enabled{false};
+
+// // Ring-buffer sample used by the viz thread
+// struct CmgSample {
+//   float qref[CMG_VIZ_NUM_JOINTS];
+//   float actual[CMG_VIZ_NUM_JOINTS];
+//   float command[CMG_VIZ_CMD_DIM];
+// };
+
+// static void BuildLegFigure(mjvFigure& fig, const std::deque<CmgSample>& ring,
+//                            const int* indices, int n_idx, const char* title,
+//                            const char* joint_names[][2]) {
+//   mjv_defaultFigure(&fig);
+//   fig.flg_extend = 1;
+//   fig.flg_legend = 1;
+//   snprintf(fig.title, sizeof(fig.title), "%s", title);
+
+//   // Line layout: for each joint i we have line 2*i = qref, line 2*i+1 = actual
+//   int n_lines = 2 * n_idx;
+//   fig.linepnt[0] = 0;  // will be set below
+//   for (int i = 0; i < n_idx; i++) {
+//     int l_ref = 2 * i;
+//     int l_act = 2 * i + 1;
+
+//     // Line names
+//     snprintf(fig.linename[l_ref], sizeof(fig.linename[0]), "%s ref", joint_names[i][0]);
+//     snprintf(fig.linename[l_act], sizeof(fig.linename[0]), "%s act", joint_names[i][0]);
+
+//     // Colors — ref: bright, actual: dim version of same hue
+//     // Use distinct hues per joint
+//     static const float hues[][3] = {
+//       {1.0f, 0.2f, 0.2f},  // red
+//       {0.2f, 0.8f, 0.2f},  // green
+//       {0.3f, 0.3f, 1.0f},  // blue
+//       {1.0f, 0.8f, 0.0f},  // yellow
+//       {1.0f, 0.4f, 0.8f},  // pink
+//       {0.0f, 0.8f, 0.8f},  // cyan
+//     };
+//     for (int c = 0; c < 3; c++) {
+//       fig.linergb[l_ref][c] = hues[i % 6][c];
+//       fig.linergb[l_act][c] = hues[i % 6][c] * 0.45f;
+//     }
+
+//     // Fill data from ring buffer
+//     int n_pts = static_cast<int>(ring.size());
+//     if (n_pts > 1000) n_pts = 1000;  // mjvFigure max is 1001
+//     fig.linepnt[l_ref] = n_pts;
+//     fig.linepnt[l_act] = n_pts;
+//     int jdx = indices[i];
+//     for (int t = 0; t < n_pts; t++) {
+//       const auto& s = ring[ring.size() - n_pts + t];
+//       float x = static_cast<float>(t);
+//       fig.linedata[l_ref][2 * t]     = x;
+//       fig.linedata[l_ref][2 * t + 1] = s.qref[jdx];
+//       fig.linedata[l_act][2 * t]     = x;
+//       fig.linedata[l_act][2 * t + 1] = s.actual[jdx];
+//     }
+//   }
+//   // Zero out remaining lines
+//   for (int l = n_lines; l < mjMAXLINE; l++) {
+//     fig.linepnt[l] = 0;
+//   }
+// }
+
+// static void BuildCommandFigure(mjvFigure& fig, const std::deque<CmgSample>& ring) {
+//   mjv_defaultFigure(&fig);
+//   fig.flg_extend = 1;
+//   fig.flg_legend = 1;
+//   snprintf(fig.title, sizeof(fig.title), "Velocity Commands");
+
+//   static const char* names[] = {"vx", "vy", "yaw_rate"};
+//   static const float colors[][3] = {
+//     {1.0f, 0.3f, 0.3f},
+//     {0.3f, 1.0f, 0.3f},
+//     {0.3f, 0.3f, 1.0f},
+//   };
+
+//   int n_pts = static_cast<int>(ring.size());
+//   if (n_pts > 1000) n_pts = 1000;
+
+//   for (int i = 0; i < 3; i++) {
+//     snprintf(fig.linename[i], sizeof(fig.linename[0]), "%s", names[i]);
+//     for (int c = 0; c < 3; c++) fig.linergb[i][c] = colors[i][c];
+//     fig.linepnt[i] = n_pts;
+//     for (int t = 0; t < n_pts; t++) {
+//       const auto& s = ring[ring.size() - n_pts + t];
+//       fig.linedata[i][2 * t]     = static_cast<float>(t);
+//       fig.linedata[i][2 * t + 1] = s.command[i];
+//     }
+//   }
+//   for (int l = 3; l < mjMAXLINE; l++) {
+//     fig.linepnt[l] = 0;
+//   }
+// }
+
+// void CmgVizThread(mj::Simulate* sim) {
+//   CMGVizReader reader;
+//   std::deque<CmgSample> ring;
+//   const int MAX_RING = 200;
+
+//   // USD joint indices for left / right leg
+//   const int left_idx[]  = {0, 3, 6, 9, 13, 17};
+//   const int right_idx[] = {1, 4, 7, 10, 14, 18};
+//   const int N_LEG = 6;
+
+//   const char* left_names[][2]  = {{"L hip_p",""}, {"L hip_r",""}, {"L hip_y",""},
+//                                    {"L knee",""}, {"L ank_p",""}, {"L ank_r",""}};
+//   const char* right_names[][2] = {{"R hip_p",""}, {"R hip_r",""}, {"R hip_y",""},
+//                                    {"R knee",""}, {"R ank_p",""}, {"R ank_r",""}};
+
+//   // Figure dimensions
+//   const int fw = 480, fh = 270;
+
+//   while (!sim->exitrequest.load()) {
+//     std::this_thread::sleep_for(std::chrono::milliseconds(33));  // ~30 Hz
+
+//     if (!cmg_viz_enabled.load(std::memory_order_relaxed)) {
+//       // If just disabled, clear figures once
+//       if (!ring.empty()) {
+//         ring.clear();
+//         // Wait until render consumed previous batch
+//         while (sim->newfigurerequest.load() != 0 && !sim->exitrequest.load()) {
+//           std::this_thread::sleep_for(std::chrono::milliseconds(5));
+//         }
+//         sim->user_figures_new_.clear();
+//         sim->newfigurerequest.store(1);
+//       }
+//       continue;
+//     }
+
+//     // Read shared memory
+//     CMGVizData snap;
+//     if (reader.read(snap)) {
+//       CmgSample s;
+//       std::memcpy(s.qref, snap.qref, sizeof(s.qref));
+//       std::memcpy(s.actual, snap.actual_pos, sizeof(s.actual));
+//       std::memcpy(s.command, snap.command, sizeof(s.command));
+//       ring.push_back(s);
+//       if (static_cast<int>(ring.size()) > MAX_RING) ring.pop_front();
+//     }
+
+//     if (ring.empty()) continue;
+
+//     // Wait for render thread to consume previous batch
+//     if (sim->newfigurerequest.load() != 0) continue;
+
+//     // Build 3 figures
+//     sim->user_figures_new_.clear();
+//     sim->user_figures_new_.reserve(3);
+
+//     {
+//       mjrRect vp = {0, 2 * fh, fw, fh};  // top-left
+//       mjvFigure fig;
+//       BuildLegFigure(fig, ring, left_idx, N_LEG, "Left Leg (qref vs actual)", left_names);
+//       sim->user_figures_new_.push_back({vp, fig});
+//     }
+//     {
+//       mjrRect vp = {0, fh, fw, fh};  // middle-left
+//       mjvFigure fig;
+//       BuildLegFigure(fig, ring, right_idx, N_LEG, "Right Leg (qref vs actual)", right_names);
+//       sim->user_figures_new_.push_back({vp, fig});
+//     }
+//     {
+//       mjrRect vp = {0, 0, fw, fh};  // bottom-left
+//       mjvFigure fig;
+//       BuildCommandFigure(fig, ring);
+//       sim->user_figures_new_.push_back({vp, fig});
+//     }
+
+//     sim->newfigurerequest.store(1);
+//   }
+// }
+
+//---------------------------------------- CMG ghost overlay ----------------------------------------
+
+void CmgGhostThread(mj::Simulate* sim) {
+  CMGVizReader reader;
+  mjData* d_ghost = nullptr;
+  mjvScene ghost_scn;
+  bool scene_ok = false;
+
+  // USD env index → SDK motor index (= MuJoCo actuated joint index)
+  // From deploy_scale_one.yaml joint_ids_map
+  static const int usd_to_mj[29] = {
+    0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22,
+    4, 10, 16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28
+  };
+
+  while (!sim->exitrequest.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(33));  // ~30 Hz
+
+    if (!cmg_viz_enabled.load(std::memory_order_relaxed)) {
+      // When disabled, clear ghost geoms once
+      if (d_ghost && !sim->ghost_scn_geoms_.empty()) {
+        while (sim->newghostrequest.load() != 0 && !sim->exitrequest.load())
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        sim->ghost_scn_geoms_new_.clear();
+        sim->newghostrequest.store(1);
+      }
+      continue;
+    }
+
+    // Wait for model to be loaded
+    if (!m) continue;
+
+    // Allocate ghost data & scene on first use (or after model reload)
+    if (!d_ghost) {
+      d_ghost = mj_makeData(m);
+      if (!d_ghost) continue;
+      mjv_makeScene(m, &ghost_scn, 5000);
+      scene_ok = true;
+    }
+
+    // Read CMG data from shared memory
+    CMGVizData snap;
+    if (!reader.read(snap)) continue;
+
+    // Wait for render to consume previous batch
+    if (sim->newghostrequest.load() != 0) continue;
+
+    // Copy base pose (free joint qpos[0:7]) from actual robot
+    {
+      const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
+      if (d) {
+        std::memcpy(d_ghost->qpos, d->qpos, 7 * sizeof(mjtNum));
+      }
+    }
+    // Offset ghost -0.5 in x
+    d_ghost->qpos[0] -= 0.5;
+
+    // Set ghost joint positions from CMG qref (USD order → MuJoCo qpos)
+    for (int u = 0; u < 29; u++) {
+      d_ghost->qpos[7 + usd_to_mj[u]] = static_cast<mjtNum>(snap.qref[u]);
+    }
+
+    // Forward kinematics to compute body positions
+    mj_forward(m, d_ghost);
+
+    // Build ghost scene (dynamic bodies only — no floor/sky)
+    ghost_scn.ngeom = 0;
+    mjvOption ghost_opt;
+    mjv_defaultOption(&ghost_opt);
+    mjv_addGeoms(m, d_ghost, &ghost_opt, nullptr, mjCAT_DYNAMIC, &ghost_scn);
+
+    // Copy geoms with transparent blue-ish tint
+    std::vector<mjvGeom> geoms;
+    geoms.reserve(ghost_scn.ngeom);
+    for (int i = 0; i < ghost_scn.ngeom; i++) {
+      mjvGeom g = ghost_scn.geoms[i];
+      // Skip non-model geoms (decoration)
+      if (g.objtype != mjOBJ_GEOM && g.objtype != mjOBJ_SITE) continue;
+      g.rgba[0] = 0.2f;
+      g.rgba[1] = 0.5f;
+      g.rgba[2] = 0.9f;
+      g.rgba[3] = 0.3f;
+      geoms.push_back(g);
+    }
+
+    sim->ghost_scn_geoms_new_ = std::move(geoms);
+    sim->newghostrequest.store(1);
+  }
+
+  if (d_ghost) mj_deleteData(d_ghost);
+  if (scene_ok) mjv_freeScene(&ghost_scn);
+}
+
+//-------------------------------------- telemetry viz ---------------------------------------------
+
+std::atomic<bool> telemetry_viz_enabled{false};
+
+struct TelemetrySample {
+  float vx, vy, vz;                // GT base linear velocity (body frame)
+  float thermal_load[29];           // EMA of tau² — proportional to motor heating
+};
+
+void TelemetryVizThread(mj::Simulate* sim) {
+  std::deque<TelemetrySample> ring;
+  const int MAX_RING = 200;
+
+  // Thermal load: exponential moving average of tau² (Nm²)
+  // Directly proportional to I²R motor heating (tau ∝ current).
+  // Rises under sustained load, decays when load is removed.
+  const float tau_smooth = 3.0f;     // EMA time constant (seconds)
+  float thermal_load[29] = {};
+  double prev_sim_time = -1.0;
+
+  // Figure dimensions
+  const int fw = 480, fh = 220;
+
+  while (!sim->exitrequest.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(33));  // ~30 Hz
+
+    if (!telemetry_viz_enabled.load(std::memory_order_relaxed)) {
+      if (!ring.empty()) {
+        ring.clear();
+        while (sim->newfigurerequest.load() != 0 && !sim->exitrequest.load())
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        sim->user_figures_new_.clear();
+        sim->newfigurerequest.store(1);
+      }
+      continue;
+    }
+
+    if (!m || !d) continue;
+
+    TelemetrySample s = {};
+    int num_joints = 0;
+    {
+      const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
+      if (!d) continue;
+
+      // GT base linear velocity: world-frame qvel → body-frame via quaternion
+      {
+        mjtNum quat_conj[4] = {d->qpos[3], -d->qpos[4], -d->qpos[5], -d->qpos[6]};
+        mjtNum v_world[3] = {d->qvel[0], d->qvel[1], d->qvel[2]};
+        mjtNum v_body[3];
+        mju_rotVecQuat(v_body, v_world, quat_conj);
+        s.vx = static_cast<float>(v_body[0]);  // forward
+        s.vy = static_cast<float>(v_body[1]);  // lateral
+        s.vz = static_cast<float>(v_body[2]);  // vertical
+      }
+
+      num_joints = std::min(m->nu, 29);
+
+      // Compute dt from simulation time (handles speed changes & pauses)
+      double sim_time = d->time;
+      float dt = 0.0f;
+      if (prev_sim_time < 0.0 || sim_time < prev_sim_time) {
+        // First tick or simulation was reset
+        for (int i = 0; i < 29; i++) thermal_load[i] = 0.0f;
+        dt = 0.0f;
+      } else {
+        dt = static_cast<float>(sim_time - prev_sim_time);
+      }
+      prev_sim_time = sim_time;
+
+      // EMA of tau²: load += (tau² - load) * alpha,  alpha = 1 - exp(-dt/tau_smooth)
+      float alpha = (dt > 0.0f) ? 1.0f - std::exp(-dt / tau_smooth) : 0.0f;
+      for (int i = 0; i < num_joints; i++) {
+        float tau = static_cast<float>(d->sensordata[i + 2 * m->nu]);
+        thermal_load[i] += (tau * tau - thermal_load[i]) * alpha;
+        s.thermal_load[i] = thermal_load[i];
+      }
+    }
+
+    ring.push_back(s);
+    if (static_cast<int>(ring.size()) > MAX_RING) ring.pop_front();
+    if (ring.empty()) continue;
+
+    // Wait for render thread to consume previous batch
+    if (sim->newfigurerequest.load() != 0) continue;
+
+    sim->user_figures_new_.clear();
+    sim->user_figures_new_.reserve(2);
+
+    // --- Figure 1: GT Linear Velocity ---
+    {
+      mjrRect vp = {0, fh, fw, fh};  // top-left
+      mjvFigure fig;
+      mjv_defaultFigure(&fig);
+      fig.flg_extend = 1;
+      fig.flg_legend = 1;
+      snprintf(fig.title, sizeof(fig.title), "GT Base Velocity - Body Frame (m/s)");
+      snprintf(fig.yformat, sizeof(fig.yformat), "%%.1f");
+
+      static const char* names[] = {"fwd", "lat", "vert"};
+      static const float colors[][3] = {
+        {1.0f, 0.3f, 0.3f},  // red
+        {0.3f, 1.0f, 0.3f},  // green
+        {0.3f, 0.3f, 1.0f},  // blue
+      };
+
+      int n_pts = static_cast<int>(ring.size());
+      if (n_pts > 1000) n_pts = 1000;
+
+      for (int i = 0; i < 3; i++) {
+        snprintf(fig.linename[i], sizeof(fig.linename[0]), "%s", names[i]);
+        for (int c = 0; c < 3; c++) fig.linergb[i][c] = colors[i][c];
+        fig.linepnt[i] = n_pts;
+        for (int t = 0; t < n_pts; t++) {
+          const auto& sample = ring[ring.size() - n_pts + t];
+          fig.linedata[i][2 * t]     = static_cast<float>(t);
+          fig.linedata[i][2 * t + 1] = (i == 0) ? sample.vx : (i == 1) ? sample.vy : sample.vz;
+        }
+      }
+      for (int l = 3; l < mjMAXLINE; l++) fig.linepnt[l] = 0;
+
+      sim->user_figures_new_.push_back({vp, fig});
+    }
+
+    // --- Figure 2: Joint Temperatures ---
+    {
+      mjrRect vp = {0, 0, fw, fh};  // bottom-left
+      mjvFigure fig;
+      mjv_defaultFigure(&fig);
+      fig.flg_extend = 1;
+      fig.flg_legend = 1;
+      snprintf(fig.title, sizeof(fig.title), "Motor Thermal Load (Nm^2)");
+      snprintf(fig.yformat, sizeof(fig.yformat), "%%.0f");
+
+      // All 12 leg joints: 6 left + 6 right
+      static const int joint_idx[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+      static const char* joint_names[] = {
+        "L hip_p", "L hip_r", "L hip_y", "L knee", "L ank_p", "L ank_r",
+        "R hip_p", "R hip_r", "R hip_y", "R knee", "R ank_p", "R ank_r",
+      };
+      static const float hues[][3] = {
+        {1.0f, 0.2f, 0.2f}, {0.2f, 0.8f, 0.2f}, {0.3f, 0.3f, 1.0f},
+        {1.0f, 0.8f, 0.0f}, {1.0f, 0.4f, 0.8f}, {0.0f, 0.8f, 0.8f},
+        {0.8f, 0.1f, 0.1f}, {0.1f, 0.6f, 0.1f}, {0.2f, 0.2f, 0.8f},
+        {0.8f, 0.6f, 0.0f}, {0.8f, 0.3f, 0.6f}, {0.0f, 0.6f, 0.6f},
+      };
+      const int n_lines = 12;
+      int n_pts = static_cast<int>(ring.size());
+      if (n_pts > 1000) n_pts = 1000;
+
+      for (int i = 0; i < n_lines; i++) {
+        snprintf(fig.linename[i], sizeof(fig.linename[0]), "%s", joint_names[i]);
+        for (int c = 0; c < 3; c++) fig.linergb[i][c] = hues[i][c];
+        fig.linepnt[i] = n_pts;
+        for (int t = 0; t < n_pts; t++) {
+          const auto& sample = ring[ring.size() - n_pts + t];
+          fig.linedata[i][2 * t]     = static_cast<float>(t);
+          fig.linedata[i][2 * t + 1] = sample.thermal_load[joint_idx[i]];
+        }
+      }
+      for (int l = n_lines; l < mjMAXLINE; l++) fig.linepnt[l] = 0;
+
+      sim->user_figures_new_.push_back({vp, fig});
+    }
+
+    sim->newfigurerequest.store(1);
+  }
+}
+
 //------------------------------------------ main --------------------------------------------------
 
 // machinery for replacing command line error by a macOS dialog box when running under Rosetta
@@ -634,6 +1076,16 @@ void user_key_cb(GLFWwindow* window, int key, int scancode, int act, int mods) {
     if(key==GLFW_KEY_BACKSPACE) {
       mj_resetData(m, d);
       mj_forward(m, d);
+    }
+    if(key==GLFW_KEY_C) {
+      bool prev = cmg_viz_enabled.load();
+      cmg_viz_enabled.store(!prev);
+      std::printf("[CMGViz] %s\n", prev ? "OFF" : "ON");
+    }
+    if(key==GLFW_KEY_T) {
+      bool prev = telemetry_viz_enabled.load();
+      telemetry_viz_enabled.store(!prev);
+      std::printf("[TelemetryViz] %s\n", prev ? "OFF" : "ON");
     }
   }
 }
@@ -687,10 +1139,19 @@ int main(int argc, char **argv)
 
   // start physics thread
   std::thread physicsthreadhandle(&PhysicsThread, sim.get(), param::config.robot_scene.c_str());
+  // start CMG visualization thread
+  // std::thread cmgvizhandle(&CmgVizThread, sim.get());
+  // start CMG ghost overlay thread
+  std::thread cmgghosthandle(&CmgGhostThread, sim.get());
+  // start telemetry visualization thread
+  std::thread telemetryvizhandle(&TelemetryVizThread, sim.get());
   // start simulation UI loop (blocking call)
   glfwSetKeyCallback(static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_,user_key_cb);
   sim->RenderLoop();
   physicsthreadhandle.join();
+  // cmgvizhandle.join();
+  cmgghosthandle.join();
+  telemetryvizhandle.join();
 
   pthread_exit(NULL);
   return 0;
