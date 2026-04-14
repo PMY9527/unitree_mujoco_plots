@@ -30,7 +30,12 @@
 #include <thread>
 
 #include <atomic>
+#include <ctime>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
 #include <mujoco/mujoco.h>
 #include "simulate.h"
@@ -898,28 +903,50 @@ void TelemetryVizThread(mj::Simulate* sim) {
   const float tau_smooth = 3.0f;     // EMA time constant (seconds)
   float thermal_load[29] = {};
   double prev_sim_time = -1.0;
+  double last_logged_sim_time = -1.0;
 
   // Figure dimensions
   const int fw = 480, fh = 220;
 
+  // Open CSV log file with timestamped name
+  std::ofstream csv;
+  std::filesystem::path log_path;
+  {
+    std::filesystem::path log_dir =
+      std::filesystem::path(getExecutableDir()).parent_path() / "logs";
+    std::error_code ec;
+    std::filesystem::create_directories(log_dir, ec);
+
+    std::time_t now = std::time(nullptr);
+    std::tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    std::ostringstream fname;
+    fname << "telemetry_" << std::put_time(&tm_buf, "%Y%m%d_%H%M%S") << ".csv";
+    log_path = log_dir / fname.str();
+
+    csv.open(log_path);
+    if (csv.is_open()) {
+      csv << "sim_time,vx_fwd";
+      for (int i = 0; i < 29; i++) csv << ",load_" << i;
+      csv << "\n";
+      csv.flush();
+      std::printf("[TelemetryViz] logging to %s\n", log_path.c_str());
+    } else {
+      std::fprintf(stderr, "[TelemetryViz] failed to open %s\n", log_path.c_str());
+    }
+  }
+
+  int flush_counter = 0;
+
   while (!sim->exitrequest.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(33));  // ~30 Hz
-
-    if (!telemetry_viz_enabled.load(std::memory_order_relaxed)) {
-      if (!ring.empty()) {
-        ring.clear();
-        while (sim->newfigurerequest.load() != 0 && !sim->exitrequest.load())
-          std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        sim->user_figures_new_.clear();
-        sim->newfigurerequest.store(1);
-      }
-      continue;
-    }
 
     if (!m || !d) continue;
 
     TelemetrySample s = {};
     int num_joints = 0;
+    double sim_time = 0.0;
+    bool sample_valid = false;
     {
       const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
       if (!d) continue;
@@ -938,11 +965,12 @@ void TelemetryVizThread(mj::Simulate* sim) {
       num_joints = std::min(m->nu, 29);
 
       // Compute dt from simulation time (handles speed changes & pauses)
-      double sim_time = d->time;
+      sim_time = d->time;
       float dt = 0.0f;
       if (prev_sim_time < 0.0 || sim_time < prev_sim_time) {
         // First tick or simulation was reset
         for (int i = 0; i < 29; i++) thermal_load[i] = 0.0f;
+        last_logged_sim_time = -1.0;
         dt = 0.0f;
       } else {
         dt = static_cast<float>(sim_time - prev_sim_time);
@@ -956,6 +984,31 @@ void TelemetryVizThread(mj::Simulate* sim) {
         thermal_load[i] += (tau * tau - thermal_load[i]) * alpha;
         s.thermal_load[i] = thermal_load[i];
       }
+      sample_valid = true;
+    }
+
+    // Always log to CSV (skip duplicates when sim is paused)
+    if (sample_valid && csv.is_open() && sim_time != last_logged_sim_time) {
+      csv << sim_time << ',' << s.vx;
+      for (int i = 0; i < 29; i++) csv << ',' << s.thermal_load[i];
+      csv << '\n';
+      last_logged_sim_time = sim_time;
+      if (++flush_counter >= 30) {  // flush ~once per second
+        csv.flush();
+        flush_counter = 0;
+      }
+    }
+
+    // Figures are only rendered when viz toggle is on
+    if (!telemetry_viz_enabled.load(std::memory_order_relaxed)) {
+      if (!ring.empty()) {
+        ring.clear();
+        while (sim->newfigurerequest.load() != 0 && !sim->exitrequest.load())
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        sim->user_figures_new_.clear();
+        sim->newfigurerequest.store(1);
+      }
+      continue;
     }
 
     ring.push_back(s);
@@ -1045,6 +1098,12 @@ void TelemetryVizThread(mj::Simulate* sim) {
     }
 
     sim->newfigurerequest.store(1);
+  }
+
+  if (csv.is_open()) {
+    csv.flush();
+    csv.close();
+    std::printf("[TelemetryViz] saved log: %s\n", log_path.c_str());
   }
 }
 
