@@ -109,6 +109,10 @@ namespace
   mjModel *m = nullptr;
   mjData *d = nullptr;
 
+  // camera and viz options (file scope so PhysicsThread can configure them after model load)
+  mjvCamera cam;
+  mjvOption opt;
+
   // control noise variables
   mjtNum *ctrlnoise = nullptr;
 
@@ -559,6 +563,17 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
       sim->Load(m, d, filename);
       mj_forward(m, d);
 
+      // Lock camera to robot torso/pelvis so view follows the body on open.
+      int track_bid = mj_name2id(m, mjOBJ_BODY, "torso_link");
+      if (track_bid < 0) track_bid = mj_name2id(m, mjOBJ_BODY, "pelvis");
+      if (track_bid < 0) track_bid = (m->nbody > 1) ? 1 : 0;
+      cam.type = mjCAMERA_TRACKING;
+      cam.trackbodyid = track_bid;
+      cam.distance = 3.0;
+      cam.lookat[2] = 0.6;
+      std::printf("[Camera] tracking body id=%d (%s), distance=%.1f\n",
+                  track_bid, mj_id2name(m, mjOBJ_BODY, track_bid), cam.distance);
+
       // allocate ctrlnoise
       free(ctrlnoise);
       ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
@@ -928,6 +943,16 @@ void TelemetryVizThread(mj::Simulate* sim) {
     if (csv.is_open()) {
       csv << "sim_time,vx_fwd";
       for (int i = 0; i < 29; i++) csv << ",load_" << i;
+      csv << ",qpos_Lknee,qpos_Rknee,ctrl_Lknee,ctrl_Rknee,tau_Lknee,tau_Rknee";
+      csv << ",qpos_LhipP,qpos_RhipP,qpos_LhipY,qpos_RhipY"
+             ",qpos_LankP,qpos_RankP,qpos_LankR,qpos_RankR";
+      // CMG qref and policy residual for the same 5 leg-joint pairs
+      csv << ",qref_Lknee,qref_Rknee,qref_LhipP,qref_RhipP,qref_LhipY,qref_RhipY"
+             ",qref_LankP,qref_RankP,qref_LankR,qref_RankR";
+      csv << ",res_Lknee,res_Rknee,res_LhipP,res_RhipP,res_LhipY,res_RhipY"
+             ",res_LankP,res_RankP,res_LankR,res_RankR";
+      // Foot ground reaction force Z (world frame, from cfrc_ext)
+      csv << ",fz_Lfoot,fz_Rfoot,seq_cmg";
       csv << "\n";
       csv.flush();
       std::printf("[TelemetryViz] logging to %s\n", log_path.c_str());
@@ -938,10 +963,30 @@ void TelemetryVizThread(mj::Simulate* sim) {
 
   int flush_counter = 0;
 
+  // CMG shared-memory reader: pulls qref + residual published by State_RLResidual.
+  // read() returns false until policy is running; snap retains last known values.
+  CMGVizReader cmg_reader;
+  CMGVizData cmg_snap{};
+  uint32_t last_cmg_seq = 0;
+
+  // Foot body IDs (resolved once after model loads)
+  int Lfoot_bid = -1, Rfoot_bid = -1;
+
   while (!sim->exitrequest.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(33));  // ~30 Hz
 
     if (!m || !d) continue;
+
+    if (Lfoot_bid < 0) {
+      const char* lnames[] = {"left_ankle_roll_link", "left_foot_link", "left_ankle_link"};
+      const char* rnames[] = {"right_ankle_roll_link", "right_foot_link", "right_ankle_link"};
+      for (auto n : lnames) { int b = mj_name2id(m, mjOBJ_BODY, n); if (b >= 0) { Lfoot_bid = b; break; } }
+      for (auto n : rnames) { int b = mj_name2id(m, mjOBJ_BODY, n); if (b >= 0) { Rfoot_bid = b; break; } }
+      std::printf("[TelemetryViz] foot body ids: L=%d R=%d\n", Lfoot_bid, Rfoot_bid);
+    }
+
+    // Refresh CMG snapshot if writer published a new sample
+    cmg_reader.read(cmg_snap);
 
     TelemetrySample s = {};
     int num_joints = 0;
@@ -987,16 +1032,49 @@ void TelemetryVizThread(mj::Simulate* sim) {
       sample_valid = true;
     }
 
-    // Always log to CSV (skip duplicates when sim is paused)
+    // Always log to CSV (skip duplicates when sim is paused).
+    // Build the entire row in an ostringstream and write atomically with flush —
+    // prevents partial rows when the process is killed mid-row.
     if (sample_valid && csv.is_open() && sim_time != last_logged_sim_time) {
-      csv << sim_time << ',' << s.vx;
-      for (int i = 0; i < 29; i++) csv << ',' << s.thermal_load[i];
-      csv << '\n';
-      last_logged_sim_time = sim_time;
-      if (++flush_counter >= 30) {  // flush ~once per second
-        csv.flush();
-        flush_counter = 0;
+      std::ostringstream row;
+      row << sim_time << ',' << s.vx;
+      for (int i = 0; i < 29; i++) row << ',' << s.thermal_load[i];
+      {
+        const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
+        if (d && m) {
+          int lk = 3, rk = 9;  // L/R knee joint indices
+          row << ',' << d->sensordata[lk]
+              << ',' << d->sensordata[rk]
+              << ',' << d->ctrl[lk]
+              << ',' << d->ctrl[rk]
+              << ',' << d->sensordata[lk + 2 * m->nu]
+              << ',' << d->sensordata[rk + 2 * m->nu];
+          // L/R hip pitch (0,6), hip yaw (2,8), ankle pitch (4,10), ankle roll (5,11)
+          int idx[8] = {0, 6, 2, 8, 4, 10, 5, 11};
+          for (int k = 0; k < 8; k++) row << ',' << d->sensordata[idx[k]];
+
+          // CMG qref + policy residual in USD joint order
+          // L/R: knee=9/10, hipP=0/1, hipY=6/7, ankP=13/14, ankR=17/18
+          int usd_idx[10] = {9, 10, 0, 1, 6, 7, 13, 14, 17, 18};
+          for (int k = 0; k < 10; k++) row << ',' << cmg_snap.qref[usd_idx[k]];
+          for (int k = 0; k < 10; k++) row << ',' << cmg_snap.raw_residual[usd_idx[k]];
+
+          // Foot Z ground reaction force (world frame, cfrc_ext layout: [tx,ty,tz,fx,fy,fz])
+          double fzL = (Lfoot_bid >= 0) ? d->cfrc_ext[6 * Lfoot_bid + 5] : 0.0;
+          double fzR = (Rfoot_bid >= 0) ? d->cfrc_ext[6 * Rfoot_bid + 5] : 0.0;
+          row << ',' << fzL << ',' << fzR << ',' << cmg_snap.seq.load(std::memory_order_relaxed);
+        } else {
+          row << ",0,0,0,0,0,0";
+          row << ",0,0,0,0,0,0,0,0";
+          row << ",0,0,0,0,0,0,0,0,0,0";  // qref
+          row << ",0,0,0,0,0,0,0,0,0,0";  // res
+          row << ",0,0,0";                  // fz_L,fz_R,seq
+        }
       }
+      row << '\n';
+      csv << row.str() << std::flush;
+      last_logged_sim_time = sim_time;
+      flush_counter = 0;  // each row already flushes; counter kept for compat
     }
 
     // Figures are only rendered when viz toggle is on
@@ -1172,11 +1250,10 @@ int main(int argc, char **argv)
   // scan for libraries in the plugin directory to load additional plugins
   scanPluginLibraries();
 
-  mjvCamera cam;
   mjv_defaultCamera(&cam);
-
-  mjvOption opt;
   mjv_defaultOption(&opt);
+  // Always show contact points on viewer open
+  opt.flags[mjVIS_CONTACTPOINT] = 1;
 
   mjvPerturb pert;
   mjv_defaultPerturb(&pert);
